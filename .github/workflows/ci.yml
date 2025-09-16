@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: ["main", "master"]
+  pull_request:
+
+jobs:
+  smoke-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt scipy librosa
+
+      - name: Generate sample audio
+        run: |
+          python - <<'PY'
+          import numpy as np
+          import soundfile as sf
+
+          sr = 48000
+          t = np.linspace(0, 1.0, sr, endpoint=False)
+          x = 0.1 * np.sin(2 * np.pi * 220 * t).astype(np.float32)
+          sf.write("smoke_input.wav", x, sr)
+          PY
+
+      - name: Run cleaner script
+        run: python car_podcast_clean_simple.py smoke_input.wav smoke_output.wav
+
+      - name: Validate output
+        run: |
+          python - <<'PY'
+          import os
+          import soundfile as sf
+
+          data, sr = sf.read("smoke_output.wav")
+          assert data.size > 0, "Output file is empty"
+          assert sr == 48000, "Unexpected sample rate"
+          assert os.path.getsize("smoke_output.wav") > 0, "Output file missing"
+          PY
