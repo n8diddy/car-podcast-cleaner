@@ -69,12 +69,13 @@ python car_podcast_clean_simple.py input.wav cleaned.wav --debreath
 Flags:
 - `--debreath` enables breath attenuation.
 - `--debreath-db` sets the attenuation amount in dB (default: 8).
-- `--debreath-hi` limits attenuation to the upper band (2–9 kHz) if you want to
-  preserve low/mid energy.
+- `--debreath-pre-ms` sets how close (in ms) an inhale must be to the next speech
+  segment to be attenuated (default: 250).
+- `--debreath-max-ms` caps the inhale duration in ms (default: 500).
 
 Tuning tips:
 - Increase `--debreath-db` if breaths still jump out after LUFS normalization.
-- If fricatives feel dulled, lower `--debreath-db` or use `--debreath-hi`.
+- If consonants feel affected, reduce `--debreath-db` or tighten `--debreath-pre-ms`.
 
 ## Tips
 - Try adjusting `TARGET_LUFS` or `SHELF_GAIN_DB` inside the script if you need a
