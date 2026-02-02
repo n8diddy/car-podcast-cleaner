@@ -51,9 +51,31 @@ If you omit the output filename, `output_clean.wav` is used by default.
   pre-convert the audio.
 - **Dynamic de-esser (`scipy`)** – The sibilance reduction block depends on
   `scipy.signal`. Install SciPy to retain the tuned de-esser for lav mics.
+- **Breath attenuation (`py-webrtcvad`)** – Optional lightweight VAD to focus the
+  debreathing stage on speech-adjacent frames. If missing, the script falls back
+  to a simple energy-based speech detector.
 - **Pedalboard extras (`NoiseGate`, `LowShelfFilter`)** – These processors ship
   with most Pedalboard 0.9.x builds. The script automatically enables the noise gate
   and gentle low-shelf warmth when the modules exist; otherwise, it quietly skips them.
+
+## Breath attenuation
+For breath-heavy recordings, enable the optional debreath stage to attenuate
+breath-like noise before loudness normalization:
+
+```bash
+python car_podcast_clean_simple.py input.wav cleaned.wav --debreath
+```
+
+Flags:
+- `--debreath` enables breath attenuation.
+- `--debreath-db` sets the attenuation amount in dB (default: 8).
+- `--debreath-pre-ms` sets how close (in ms) an inhale must be to the next speech
+  segment to be attenuated (default: 250).
+- `--debreath-max-ms` caps the inhale duration in ms (default: 500).
+
+Tuning tips:
+- Increase `--debreath-db` if breaths still jump out after LUFS normalization.
+- If consonants feel affected, reduce `--debreath-db` or tighten `--debreath-pre-ms`.
 
 ## Tips
 - Try adjusting `TARGET_LUFS` or `SHELF_GAIN_DB` inside the script if you need a

@@ -2,5 +2,6 @@ numpy
 soundfile
 pyloudnorm
 pedalboard
+scipy
 # Optional: librosa  # Resampling support when sources are not 48 kHz
-# Optional: scipy    # Dynamic de-esser (scipy.signal)
+# Optional: py-webrtcvad  # VAD for breath attenuation
