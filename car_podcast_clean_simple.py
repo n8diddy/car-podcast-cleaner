@@ -2,8 +2,10 @@
 # Car speech cleanup:
 # 1) If input is .m4a/.mp3, auto-convert to temp 48k WAV via ffmpeg (if available)
 # 2) High-pass @50 Hz → (optional NoiseGate) → **Dynamic De-Esser (5–9 kHz)** → Low-pass @12 kHz → Gentle Compressor → Limiter
-# 3) Loudness normalize to -16 LUFS (podcast)
+# 3) Optional breath attenuation (heuristic)
+# 4) Loudness normalize to -16 LUFS (podcast)
 
+import argparse
 import os
 import sys
 import tempfile
@@ -28,6 +30,12 @@ try:
 except Exception:
     HAVE_LOWSHELF = False
 
+try:
+    import webrtcvad
+    HAVE_WEBRTCVAD = True
+except Exception:
+    HAVE_WEBRTCVAD = False
+
 # ---- User-tunable defaults ----
 TARGET_LUFS = -16.0        # -16 for podcasts; -14 for YouTube
 TRUE_PEAK_CEILING = -1.0   # dBTP limiter ceiling
@@ -46,8 +54,18 @@ DEESS_MAX_REDUCTION_DB = 8.0      # cap maximum attenuation
 DEESS_ATTACK_MS = 5.0             # fast attack
 DEESS_RELEASE_MS = 80.0           # moderate release
 
-IN_PATH  = sys.argv[1] if len(sys.argv) > 1 else "input.wav"
-OUT_PATH = sys.argv[2] if len(sys.argv) > 2 else "output_clean.wav"
+# Breath attenuation settings
+BREATH_FRAME_MS = 20.0
+BREATH_HOP_MS = 10.0
+BREATH_BAND_LOW = (80.0, 300.0)
+BREATH_BAND_MID = (300.0, 2000.0)
+BREATH_BAND_HIGH = (2000.0, 9000.0)
+BREATH_SCORE_THRESHOLD = 2.5
+BREATH_LEVEL_CAP_DBFS = -30.0
+BREATH_MIN_DURATION_MS = 40.0
+BREATH_ATTACK_MS = 8.0
+BREATH_RELEASE_MS = 120.0
+BREATH_EXPAND_FRAMES = 2
 
 # ---------- I/O helpers ----------
 def ensure_wav(path: str, target_sr: int = 48000) -> str:
@@ -131,6 +149,172 @@ def de_ess(x: np.ndarray, sr: int) -> np.ndarray:
     y = x - (band - band_reduced)  # x - (1-gain)*band
     return y.astype(np.float32)
 
+# ---------- Breath attenuation ----------
+def _frame_rms(x: np.ndarray, frame_len: int, hop: int) -> np.ndarray:
+    if len(x) < frame_len:
+        return np.array([], dtype=np.float32)
+    x = np.ascontiguousarray(x)
+    frame_count = 1 + (len(x) - frame_len) // hop
+    shape = (frame_count, frame_len)
+    strides = (x.strides[0] * hop, x.strides[0])
+    frames = np.lib.stride_tricks.as_strided(x, shape=shape, strides=strides)
+    return np.sqrt(np.mean(frames ** 2, axis=1) + 1e-12).astype(np.float32)
+
+
+def _speech_mask_vad(x: np.ndarray, sr: int, frame_len: int, hop: int) -> np.ndarray:
+    if not HAVE_WEBRTCVAD:
+        return np.array([], dtype=bool)
+    vad = webrtcvad.Vad(2)
+    x16 = np.clip(x, -1.0, 1.0)
+    x16 = (x16 * 32768.0).astype(np.int16)
+    frame_count = 1 + (len(x16) - frame_len) // hop if len(x16) >= frame_len else 0
+    mask = np.zeros(frame_count, dtype=bool)
+    for i in range(frame_count):
+        start = i * hop
+        frame = x16[start:start + frame_len]
+        if len(frame) < frame_len:
+            break
+        mask[i] = vad.is_speech(frame.tobytes(), sr)
+    return mask
+
+
+def _speech_mask_energy(x: np.ndarray, frame_len: int, hop: int) -> np.ndarray:
+    rms = _frame_rms(x, frame_len, hop)
+    if rms.size == 0:
+        return np.array([], dtype=bool)
+    rms_db = 20.0 * np.log10(rms + 1e-12)
+    noise_floor = np.percentile(rms_db, 20)
+    threshold = noise_floor + 10.0
+    return rms_db > threshold
+
+
+def _expand_mask(mask: np.ndarray, frames: int) -> np.ndarray:
+    if mask.size == 0 or frames <= 0:
+        return mask
+    kernel = np.ones(frames * 2 + 1, dtype=np.int32)
+    padded = np.convolve(mask.astype(np.int32), kernel, mode="same")
+    return padded > 0
+
+
+def _min_duration(mask: np.ndarray, min_frames: int) -> np.ndarray:
+    if mask.size == 0 or min_frames <= 1:
+        return mask
+    cleaned = mask.copy()
+    start = None
+    for i, is_on in enumerate(mask):
+        if is_on and start is None:
+            start = i
+        if not is_on and start is not None:
+            if i - start < min_frames:
+                cleaned[start:i] = False
+            start = None
+    if start is not None and len(mask) - start < min_frames:
+        cleaned[start:] = False
+    return cleaned
+
+
+def _moving_average(x: np.ndarray, window: int) -> np.ndarray:
+    if x.size == 0 or window <= 1:
+        return x
+    kernel = np.ones(window, dtype=np.float32) / float(window)
+    return np.convolve(x, kernel, mode="same")
+
+
+def _breath_envelope(target_gain: np.ndarray, sr: int, attack_ms: float, release_ms: float) -> np.ndarray:
+    if target_gain.size == 0:
+        return target_gain
+    attack_coeff = np.exp(-1.0 / max(1, int(sr * (attack_ms / 1000.0))))
+    release_coeff = np.exp(-1.0 / max(1, int(sr * (release_ms / 1000.0))))
+    env = np.zeros_like(target_gain)
+    g = 1.0
+    for i, tgt in enumerate(target_gain):
+        coeff = attack_coeff if tgt < g else release_coeff
+        g = coeff * g + (1.0 - coeff) * tgt
+        env[i] = g
+    return env
+
+
+def attenuate_breaths(x: np.ndarray, sr: int, attenuation_db: float, high_band_only: bool) -> np.ndarray:
+    from scipy.signal import butter, sosfilt, stft
+
+    frame_len = int(sr * (BREATH_FRAME_MS / 1000.0))
+    hop = int(sr * (BREATH_HOP_MS / 1000.0))
+    if frame_len <= 0 or hop <= 0 or len(x) < frame_len:
+        return x
+
+    # Voice activity detection to focus on speech-adjacent noise
+    speech_mask = _speech_mask_vad(x, sr, frame_len, hop)
+    if speech_mask.size == 0:
+        speech_mask = _speech_mask_energy(x, frame_len, hop)
+
+    if speech_mask.size == 0:
+        return x
+
+    speech_mask = _expand_mask(speech_mask, BREATH_EXPAND_FRAMES)
+
+    # STFT for band energy ratios
+    freqs, _, zxx = stft(
+        x,
+        fs=sr,
+        window="hann",
+        nperseg=frame_len,
+        noverlap=frame_len - hop,
+        boundary=None,
+        padded=False,
+    )
+    power = np.abs(zxx) ** 2
+
+    def band_energy(band):
+        lo, hi = band
+        idx = (freqs >= lo) & (freqs < hi)
+        if not np.any(idx):
+            return np.zeros(power.shape[1], dtype=np.float32)
+        return power[idx].sum(axis=0).astype(np.float32)
+
+    low_energy = band_energy(BREATH_BAND_LOW)
+    mid_energy = band_energy(BREATH_BAND_MID)
+    high_energy = band_energy(BREATH_BAND_HIGH)
+    score = high_energy / (low_energy + mid_energy + 1e-12)
+    score = _moving_average(score, 3)
+
+    rms = _frame_rms(x, frame_len, hop)
+    if rms.size == 0:
+        return x
+    rms_db = 20.0 * np.log10(rms + 1e-12)
+
+    breath_mask = (
+        (score > BREATH_SCORE_THRESHOLD)
+        & (rms_db < BREATH_LEVEL_CAP_DBFS)
+        & speech_mask[: score.size]
+    )
+
+    min_frames = int(np.ceil(BREATH_MIN_DURATION_MS / BREATH_HOP_MS))
+    breath_mask = _min_duration(breath_mask, min_frames)
+
+    if not np.any(breath_mask):
+        return x
+
+    target_gain_frames = np.where(breath_mask, 10.0 ** (-attenuation_db / 20.0), 1.0).astype(np.float32)
+
+    frame_centers = (np.arange(target_gain_frames.size) * hop + frame_len / 2) / sr
+    sample_times = np.arange(len(x)) / sr
+    target_gain = np.interp(sample_times, frame_centers, target_gain_frames, left=1.0, right=1.0).astype(np.float32)
+
+    env = _breath_envelope(target_gain, sr, BREATH_ATTACK_MS, BREATH_RELEASE_MS)
+
+    if high_band_only:
+        hi_lo, hi_hi = BREATH_BAND_HIGH
+        hi_hi = min(hi_hi, sr * 0.49)
+        hi_lo = max(10.0, min(hi_lo, hi_hi - 100.0))
+        sos = butter(4, [hi_lo / (sr * 0.5), hi_hi / (sr * 0.5)], btype="band", output="sos")
+        band = sosfilt(sos, x).astype(np.float32)
+        band_reduced = band * env
+        y = x - (band - band_reduced)
+    else:
+        y = x * env
+
+    return y.astype(np.float32)
+
 # ---------- Pedalboard chain ----------
 def build_board() -> Pedalboard:
     chain = [HighpassFilter(cutoff_frequency_hz=HPF_CUTOFF)]
@@ -166,14 +350,27 @@ def loudness_normalize(x: np.ndarray, sr: int, target_lufs: float = TARGET_LUFS)
     y = Pedalboard([Limiter(threshold_db=TRUE_PEAK_CEILING)]).process(y, sample_rate=sr)  # safety re-limit
     return y
 
+# ---------- CLI ----------
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description="Clean car podcast audio with optional de-breathing.")
+    parser.add_argument("input", nargs="?", default="input.wav", help="Input audio path (wav/m4a/mp3).")
+    parser.add_argument("output", nargs="?", default="output_clean.wav", help="Output WAV path.")
+    parser.add_argument("--debreath", action="store_true", help="Enable breath attenuation before loudness normalization.")
+    parser.add_argument("--debreath-db", type=float, default=8.0, help="Breath attenuation amount in dB (default: 8).")
+    parser.add_argument("--debreath-hi", action="store_true", help="Attenuate only the high band when de-breathing.")
+    return parser.parse_args(argv)
+
 # ---------- Main ----------
-def main():
-    src = ensure_wav(IN_PATH, target_sr=48000)
+def main(argv=None):
+    args = parse_args(argv)
+    src = ensure_wav(args.input, target_sr=48000)
     x, sr = read_wav_mono_48k(src)
     y = process_audio(x, sr)
+    if args.debreath:
+        y = attenuate_breaths(y, sr, attenuation_db=args.debreath_db, high_band_only=args.debreath_hi)
     y = loudness_normalize(y, sr, TARGET_LUFS)
-    sf.write(OUT_PATH, y, sr, subtype="PCM_24")
-    print(f"Done -> {OUT_PATH}")
+    sf.write(args.output, y, sr, subtype="PCM_24")
+    print(f"Done -> {args.output}")
 
 if __name__ == "__main__":
     main()
